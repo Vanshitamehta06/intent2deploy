@@ -535,11 +535,13 @@ function ValidationPanel({
   workflow,
   busy,
   act,
+  view,
 }: {
   workflowId: string;
   workflow: Workflow;
   busy: boolean;
   act: <T>(fn: () => Promise<T>) => Promise<void>;
+  view: "tests" | "validation" | "repair";
 }) {
   const [results, setResults] = useState<ValidationResultItem[] | null>(null);
   const [tests, setTests] = useState<GeneratedTestItem[] | null>(null);
@@ -579,7 +581,7 @@ function ValidationPanel({
       )}
 
       {/* Summary banner */}
-      {results && results.length > 0 && (
+      {view === "validation" && results && results.length > 0 && (
         <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 14, flexWrap: "wrap" }}>
           <StatusBadge state={workflow.state.includes("PASSED") ? "VALIDATION_PASSED" : workflow.state === "VALIDATION_FAILED" ? "VALIDATION_FAILED" : workflow.state} />
           <span style={{ fontSize: 13, color: "var(--text-muted)" }}>
@@ -597,7 +599,7 @@ function ValidationPanel({
       {loadErr && <div className="callout callout-danger">{loadErr}</div>}
 
       {/* Validation results */}
-      {latestResults.length > 0 && (
+      {view === "validation" && latestResults.length > 0 && (
         <div style={{ marginBottom: 16 }}>
           <div className="sec-header" style={{ marginBottom: 8 }}>
             <span className="sec-header-title">Validation results (attempt {latestAttempt})</span>
@@ -634,8 +636,23 @@ function ValidationPanel({
       )}
 
       {/* Tests */}
-      {tests && tests.length > 0 && (
-        <details style={{ marginBottom: 14 }}>
+      {view === "tests" && (() => {
+        const unit = latestResults.find((r) => r.stage === "unit_tests");
+        const summary = unit && (unit.stdout.match(/(\d+ passed[^\n]*)/) ?? [])[1];
+        return unit ? (
+          <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+            <StatusBadge state={unit.status} />
+            <span style={{ fontSize: 13 }}>
+              Test suite: <code>{unit.command}</code>{summary && <> — {summary}</>} · {unit.duration_ms}ms
+            </span>
+          </div>
+        ) : null;
+      })()}
+      {view === "tests" && tests && tests.length === 0 && (
+        <div className="empty-state">No new test files for this change — the project's existing tests cover it.</div>
+      )}
+      {view === "tests" && tests && tests.length > 0 && (
+        <details open style={{ marginBottom: 14 }}>
           <summary style={{ fontSize: 12.5, fontWeight: 600, cursor: "pointer", color: "var(--text-muted)" }}>
             {tests.length} generated test file{tests.length !== 1 ? "s" : ""}
           </summary>
@@ -657,7 +674,14 @@ function ValidationPanel({
       )}
 
       {/* Repair section */}
-      {(workflow.state === "VALIDATION_FAILED" || (repairs && repairs.length > 0)) && (
+      {view === "repair" && repairs && repairs.length === 0 && workflow.state !== "VALIDATION_FAILED" && (
+        <div className="empty-state">
+          {results && results.length > 0
+            ? "No repair was needed: validation passed on the first attempt. A repair is proposed only when a validation stage fails (at most 2 attempts, each needing your approval)."
+            : "A repair is proposed only if validation fails."}
+        </div>
+      )}
+      {view === "repair" && (workflow.state === "VALIDATION_FAILED" || (repairs && repairs.length > 0)) && (
         <div>
           <div className="sec-header" style={{ marginBottom: 8 }}>
             <span className="sec-header-title">Repair attempts ({workflow.repair_attempts}/2)</span>
@@ -737,6 +761,111 @@ function ValidationPanel({
             ? "Running…"
             : "No validation data yet. Approve changes to trigger test generation."}
         </div>
+      )}
+    </div>
+  );
+}
+
+type ChaosItem = Awaited<ReturnType<typeof api.getChaos>>["experiments"][number];
+
+const RESULT_TONE: Record<string, string> = { PASSED: "success", FAILED: "danger", PRE_EXISTING: "warn", NOT_APPLICABLE: "" };
+const RESULT_LABEL: Record<string, string> = {
+  PASSED: "passed", FAILED: "failed", PRE_EXISTING: "pre-existing", NOT_APPLICABLE: "not applicable",
+};
+
+/** Resilience Testing: the experiments that were actually run, each with what
+ * was injected, what should happen and what did. Chaos Simulation: the whole
+ * fault catalog, including which faults don't apply to this app and why. */
+function ResiliencePanel({ workflowId, workflow, mode }: { workflowId: string; workflow: Workflow; mode: "resilience" | "chaos" }) {
+  const [items, setItems] = useState<ChaosItem[] | null>(null);
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+  const [showNA, setShowNA] = useState(false);
+
+  useEffect(() => {
+    api.getChaos(workflowId).then((r) => setItems(r.experiments)).catch(() => setItems([]));
+  }, [workflowId, workflow.state]);
+
+  async function rerun() {
+    setRunning(true);
+    setErr("");
+    try {
+      setItems((await api.runChaos(workflowId)).experiments);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  if (items === null) return <div className="empty-state">Loading experiments…</div>;
+  const applicable = items.filter((c) => c.result !== "NOT_APPLICABLE");
+  const live = applicable.filter((c) => c.target === "Running service (live)");
+  const notApplicable = items.filter((c) => c.result === "NOT_APPLICABLE");
+  // Faults that ran come first; the ones that don't fit this app stay folded away.
+  const shown = mode === "chaos" && showNA ? [...applicable, ...notApplicable] : applicable;
+  const passed = applicable.filter((c) => c.result === "PASSED").length;
+
+  return (
+    <div>
+      <p style={{ fontSize: 13, color: "var(--text-muted)", margin: "0 0 12px" }}>
+        {mode === "resilience"
+          ? "Faults injected to see whether the app keeps working. Live experiments were run against the app itself during validation; the rest come from analysing the code."
+          : "The full fault catalog. Each fault is checked only where this app's architecture has the part it targets — the others are listed with the reason they don't apply."}
+      </p>
+      <div className="ci-summary" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
+        <div><strong>{items.length}</strong><span>faults in the catalog</span></div>
+        <div><strong>{applicable.length}</strong><span>apply to this app</span></div>
+        <div><strong className="ok">{passed}</strong><span>passed</span></div>
+        <div><strong>{live.length}</strong><span>run live on the app</span></div>
+      </div>
+      {err && <div className="callout callout-danger">{err}</div>}
+      {items.length === 0 && (
+        <div className="empty-state">Experiments run automatically after validation.</div>
+      )}
+      {items.length > 0 && applicable.length === 0 && (mode === "resilience" || !showNA) && (
+        <div className="empty-state">
+          None of the catalog's faults apply to this app (no outside services, cache, queue or database server to fail), and no
+          live checks have run yet.
+        </div>
+      )}
+      {shown.map((c) => {
+        const isOpen = open === c.experiment_id;
+        return (
+          <div key={c.experiment_id} className={`ev-card${isOpen ? " open" : ""}`} style={{ marginLeft: 0 }}>
+            <button type="button" className="ev-card-head" onClick={() => setOpen(isOpen ? null : c.experiment_id)} aria-expanded={isOpen}>
+              <span className="ev-rank">{c.experiment_id}</span>
+              <span className="ev-title"><strong>{c.fault}</strong>{c.target !== c.fault && <span className="ev-file-dim"> · {c.target}</span>}</span>
+              {c.target === "Running service (live)" && <span className="ev-method symbol">live</span>}
+              <span className={`tag ${RESULT_TONE[c.result] ?? ""}`}>{RESULT_LABEL[c.result] ?? c.result}</span>
+              <span className="ev-chevron" aria-hidden="true">{isOpen ? "▾" : "▸"}</span>
+            </button>
+            {!isOpen && c.result === "NOT_APPLICABLE" && <div className="ev-peek" style={{ fontFamily: "inherit" }}>{c.observed_behavior}</div>}
+            {isOpen && (
+              <div className="ev-body" style={{ fontSize: 12.5 }}>
+                {c.result !== "NOT_APPLICABLE" && (
+                  <>
+                    <div><strong>Hypothesis:</strong> {c.hypothesis}</div>
+                    <div><strong>Expected:</strong> {c.expected_behavior}</div>
+                  </>
+                )}
+                <div><strong>{c.result === "NOT_APPLICABLE" ? "Why it doesn't apply:" : "Observed:"}</strong> {c.observed_behavior}</div>
+                {c.evidence.length > 0 && <div style={{ color: "var(--text-muted)" }}><strong>Evidence:</strong> {c.evidence.join(", ")}</div>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {mode === "chaos" && notApplicable.length > 0 && (
+        <button type="button" className="btn" style={{ marginTop: 4, marginRight: 8 }} onClick={() => setShowNA((v) => !v)}>
+          {showNA ? "Hide" : "Show"} {notApplicable.length} not applicable {notApplicable.length === 1 ? "fault" : "faults"}
+        </button>
+      )}
+      {items.length > 0 && (
+        <button className="btn" style={{ marginTop: 8 }} disabled={running} onClick={rerun}>
+          {running ? "Running experiments…" : "Re-run experiments"}
+        </button>
       )}
     </div>
   );
@@ -2229,8 +2358,20 @@ function StagePanel({
   if (["Code Generation"].includes(stageName)) {
     return <CodegenPanel workflowId={workflowId} workflow={workflow} busy={busy} act={act} />;
   }
-  if (["Test Generation", "Validation", "AI Repair", "Resilience Testing", "Chaos Simulation"].includes(stageName)) {
-    return <ValidationPanel workflowId={workflowId} workflow={workflow} busy={busy} act={act} />;
+  if (stageName === "Test Generation") {
+    return <ValidationPanel workflowId={workflowId} workflow={workflow} busy={busy} act={act} view="tests" />;
+  }
+  if (stageName === "Validation") {
+    return <ValidationPanel workflowId={workflowId} workflow={workflow} busy={busy} act={act} view="validation" />;
+  }
+  if (stageName === "AI Repair") {
+    return <ValidationPanel workflowId={workflowId} workflow={workflow} busy={busy} act={act} view="repair" />;
+  }
+  if (stageName === "Resilience Testing") {
+    return <ResiliencePanel workflowId={workflowId} workflow={workflow} mode="resilience" />;
+  }
+  if (stageName === "Chaos Simulation") {
+    return <ResiliencePanel workflowId={workflowId} workflow={workflow} mode="chaos" />;
   }
   if (stageName === "Production Readiness") {
     return <ReadinessPanel workflowId={workflowId} workflow={workflow} busy={busy} act={act} />;
@@ -2511,7 +2652,8 @@ export function WorkflowDetailPage() {
   const currentStageData = pipeline.find((s) => s.name === selectedStage) ?? pipeline[0] ?? null;
 
   // Compute progress: how many stages are PASSED or FAILED (not PENDING)
-  const doneCount = pipeline.filter((s) => ["PASSED", "FAILED", "BLOCKED", "SKIPPED"].includes(s.status)).length;
+  const finished = (s: PipelineStage) => ["PASSED", "FAILED", "BLOCKED", "SKIPPED", "NOT_APPLICABLE"].includes(s.status);
+  const doneCount = pipeline.filter(finished).length;
   const progressPct = pipeline.length > 0 ? Math.round((doneCount / pipeline.length) * 100) : 0;
 
   return (
@@ -2596,7 +2738,7 @@ export function WorkflowDetailPage() {
       <div className="wf-nav-wrap" style={{ marginBottom: 14 }}>
         <div className="wf-nav-header">
           <span className="wf-nav-meta">
-            {pipeline.filter((s) => s.status === "PASSED").length}/{pipeline.length} stages complete
+            {pipeline.filter(finished).length}/{pipeline.length} stages complete
           </span>
           {AUTOMATIC_STEPS[state] ? (
             <button

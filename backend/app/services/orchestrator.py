@@ -1734,6 +1734,55 @@ def run_risk_analysis(session: Session, workflow_id: str) -> list[RiskItem]:
     return rows
 
 
+# Faults the live production checks (validation stages prod_*) actually
+# exercised against the running app: (experiment, live stage, what was done).
+_LIVE_EXPERIMENTS = (
+    ("CH09", "prod_load", "High request load / burst traffic",
+     "Concurrent requests against the running app: no errors and p95 latency within budget."),
+    ("CH07", "prod_recovery", "Service crash",
+     "The running app was stopped and restarted: it released its port and came back healthy."),
+    ("CH06", "prod_robustness", "Malformed and hostile input",
+     "Malformed JSON, oversized and deeply nested payloads, injection strings: no server error, no leaked "
+     "stack trace, still healthy afterwards."),
+)
+
+
+def _apply_live_evidence(session: Session, workflow_id: str, outcomes: list) -> None:
+    """Static analysis can't judge every architecture, but validation already
+    injected these faults into the running app. Where it did, its result is the
+    experiment's result (replacing NOT_APPLICABLE), with its report as evidence."""
+    from app.services.chaos.engine import ChaosOutcome
+
+    rows = session.exec(select(ValidationResult).where(ValidationResult.workflow_id == workflow_id)).all()
+    if not rows:
+        return
+    attempt = max(r.attempt for r in rows)
+    live = {r.stage: r for r in rows if r.attempt == attempt and r.stage.startswith("prod_")}
+    by_id = {o.experiment_id: i for i, o in enumerate(outcomes)}
+    for exp_id, stage, fault, expected in _LIVE_EXPERIMENTS:
+        result = live.get(stage)
+        if result is None or result.status not in ("passed", "failed"):
+            continue  # not run live (skipped or disabled): keep the static verdict
+        i = by_id.get(exp_id)
+        if i is not None and outcomes[i].result in ("PASSED", "FAILED"):
+            continue  # a code-level experiment already decided it
+        summary = [line.strip() for line in result.stdout.splitlines() if line.startswith(("PASS", "FAIL"))]
+        outcome = ChaosOutcome(
+            experiment_id=exp_id,
+            target="Running service (live)",
+            hypothesis=f"The app keeps serving correctly under: {fault.lower()}.",
+            fault=fault,
+            expected_behavior=expected,
+            observed_behavior=("Held up: " if result.status == "passed" else "Did not hold up: ") + "; ".join(summary[:4]),
+            result="PASSED" if result.status == "passed" else "FAILED",
+            evidence=[f"validation stage {stage} ({result.duration_ms} ms)"],
+        )
+        if i is None:
+            outcomes.append(outcome)
+        else:
+            outcomes[i] = outcome
+
+
 def run_chaos_simulation(session: Session, workflow_id: str) -> list[ChaosExperiment]:
     workflow = get_workflow(session, workflow_id)
     repository = session.get(Repository, workflow.repository_id)
@@ -1755,13 +1804,14 @@ def run_chaos_simulation(session: Session, workflow_id: str) -> list[ChaosExperi
     changed_files = [c.file for c in changes]
 
     outcomes = run_experiments(target_root, changed_files, workflow.intent)
+    _apply_live_evidence(session, workflow_id, outcomes)
 
     # A failure whose evidence lies entirely in files this change does not
     # touch is a pre-existing weakness of the repository, not a regression
     # introduced by this change: keep it visible, but don't attribute it.
     touched = {f.replace("\\", "/") for f in changed_files}
     for o in outcomes:
-        if o.result == "FAILED" and o.evidence and not touched.intersection(e.replace("\\", "/") for e in o.evidence):
+        if o.result == "FAILED" and o.target != "Running service (live)" and o.evidence and not touched.intersection(e.replace("\\", "/") for e in o.evidence):
             o.result = "PRE_EXISTING"
             o.observed_behavior = f"Pre-existing in code this change does not touch: {o.observed_behavior}"
 

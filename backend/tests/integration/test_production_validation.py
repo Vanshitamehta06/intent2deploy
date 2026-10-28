@@ -168,6 +168,16 @@ def test_workflow_validation_runs_the_service_live(db_session, demo_repo_copy, m
     assessment = orch.run_production_readiness(db_session, wf.id)
     assert json.loads(assessment.checklist_json)["production_tests"] == "PASSED"
 
+    # Resilience uses the faults validation injected into the running app.
+    from app.models.models import ChaosExperiment
+    from app.services.pipeline_view import build_pipeline
+
+    chaos = {c.experiment_id: c for c in db_session.exec(select(ChaosExperiment).where(ChaosExperiment.workflow_id == wf.id))}
+    assert chaos["CH07"].result == "PASSED" and chaos["CH07"].target == "Running service (live)"  # crash + restart
+    assert chaos["CH06"].result == "PASSED" and "prod_robustness" in chaos["CH06"].evidence_json
+    stages = {s["name"]: s["status"] for s in build_pipeline(db_session, wf.id)["stages"]}
+    assert stages["Resilience Testing"] in ("PASSED", "FAILED") and stages["Chaos Simulation"] in ("PASSED", "FAILED")
+
 
 @pytest.mark.parametrize("broken", [False, True])
 def test_ci_production_check_script_passes_good_apps_and_fails_broken_ones(tmp_path, broken):

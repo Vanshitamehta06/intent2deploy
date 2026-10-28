@@ -247,7 +247,8 @@ def build_pipeline(session: Session, workflow_id: str) -> dict:
     stages.append(
         _stage(
             "Resilience Testing",
-            "PASSED" if applicable_chaos and all(c.result == "PASSED" for c in applicable_chaos) else ("FAILED" if applicable_chaos else "PENDING"),
+            "PASSED" if applicable_chaos and all(c.result == "PASSED" for c in applicable_chaos)
+            else ("FAILED" if applicable_chaos else "NOT_APPLICABLE" if chaos else "PENDING"),
             output=(f"{len(applicable_chaos)} applicable experiment(s)" + preexisting_note) if chaos else "",
         )
     )

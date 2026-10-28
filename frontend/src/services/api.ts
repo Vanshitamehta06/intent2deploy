@@ -1,4 +1,5 @@
 import type {
+  ChaosExperimentItem,
   AddOnItem,
   AlertCounts,
   AlertItem,
@@ -266,6 +267,9 @@ export const api = {
       }[];
     }>(`/api/workflows/${id}/ci/workflows`),
 
+  getChaos: (id: string) => request<{ experiments: ChaosExperimentItem[] }>(`/api/workflows/${id}/chaos`),
+  runChaos: (id: string) =>
+    request<{ experiments: ChaosExperimentItem[] }>(`/api/workflows/${id}/chaos/run`, { method: "POST" }),
   getRisks: (id: string) => request<{ risks: RiskItem[] }>(`/api/workflows/${id}/risks`),
   analyzeRisks: (id: string) => request<{ risks: RiskItem[] }>(`/api/workflows/${id}/risks/analyze`, { method: "POST" }),
 

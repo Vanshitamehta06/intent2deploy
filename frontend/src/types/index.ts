@@ -851,3 +851,17 @@ export interface AddOnItem {
   description: string;
   status: "available" | "applied" | "not_supported";
 }
+
+/** One resilience/chaos experiment and its outcome. */
+export interface ChaosExperimentItem {
+  experiment_id: string;
+  target: string;
+  hypothesis: string;
+  fault: string;
+  expected_behavior: string;
+  observed_behavior: string;
+  result: "PASSED" | "FAILED" | "NOT_APPLICABLE" | "PRE_EXISTING";
+  environment: string;
+  evidence: string[];
+  timestamp: string;
+}
